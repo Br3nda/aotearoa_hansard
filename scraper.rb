@@ -32,48 +32,96 @@ module HansardSearch
   URL = "https://hansard.parliament.nz/api/data/search"
   PAGE_SIZE = 50
 
-  # Default to a recent rolling window for routine scheduled runs, rather than re-fetching the
-  # entire multi-decade corpus every time - set HANSARD_DATE_FROM/HANSARD_DATE_TO to widen this
-  # for a one-off historical backfill (e.g. via `morph-cli`).
-  def self.date_from
+  # Be gentle: cap how many pages either fetch below can take in a single run, spaced out
+  # rather than fired in a burst. Raise HANSARD_MAX_PAGES for a deliberate one-off backfill.
+  MAX_PAGES_PER_RUN = (ENV["HANSARD_MAX_PAGES"] || 5).to_i
+  DELAY_BETWEEN_REQUESTS = 1 # seconds
+
+  # How many days further back the historical backfill walks on each run - small and steady,
+  # rather than requesting decades of history in one go. Raise HANSARD_BACKFILL_DAYS to speed
+  # up a deliberate one-off backfill.
+  BACKFILL_DAYS_PER_RUN = (ENV["HANSARD_BACKFILL_DAYS"] || 2).to_i
+
+  # Recent rolling window, to stay current with newly-published/updated content - independent
+  # of the backfill below, which only ever moves backwards through history.
+  def self.recent_date_from
     ENV["HANSARD_DATE_FROM"] || (Date.today - 14).iso8601
   end
 
-  def self.date_to
+  def self.recent_date_to
     ENV["HANSARD_DATE_TO"] || Date.today.iso8601
   end
 
+  # Where the backfill has reached, tracked explicitly rather than inferred from
+  # MIN(sittingDate) - a fetch can be cut short by MAX_PAGES_PER_RUN, so what we've actually
+  # saved isn't reliable evidence of what's been *fully* covered. On a brand new database,
+  # start right where the recent window's own lower bound is, so the two don't overlap.
+  def self.backfill_frontier
+    rows = ScraperWiki.select("value AS d FROM scraper_state WHERE key = 'backfill_frontier'")
+    date = rows.first && rows.first["d"]
+    Date.parse(date || recent_date_from)
+  rescue SqliteMagic::NoSuchTable
+    Date.parse(recent_date_from)
+  end
+
+  def self.backfill_frontier=(date)
+    ScraperWiki.save_sqlite(["key"], { "key" => "backfill_frontier", "value" => date.iso8601 }, "scraper_state")
+  end
+
   def self.run
+    fetch_range(date_from: recent_date_from, date_to: recent_date_to, label: "recent window")
+
+    frontier = backfill_frontier
+    backfill_to = frontier - 1
+    backfill_from = backfill_to - BACKFILL_DAYS_PER_RUN + 1
+    complete = fetch_range(date_from: backfill_from.iso8601, date_to: backfill_to.iso8601, label: "backfill")
+
+    # Only move the frontier back if we're confident we actually got everything in this slice -
+    # otherwise retry the same range next run rather than silently skip past ungrabbed data.
+    self.backfill_frontier = backfill_from if complete
+  end
+
+  # Returns true if the whole range was fetched (didn't get cut short by MAX_PAGES_PER_RUN).
+  def self.fetch_range(date_from:, date_to:, label:)
     page = 1
     total_saved = 0
 
     loop do
-      records = post_search(page: page)
+      records = post_search(date_from: date_from, date_to: date_to, page: page)
       break if records.empty?
 
-      records.each do |record|
-        ScraperWiki.save_sqlite(
-          ["id"],
-          {
-            "id" => record["id"],
-            "documentType" => record["documentType"],
-            "documentSubtype" => record["documentSubtype"],
-            "sittingDate" => record["sittingDate"],
-            "parentId" => record["parentId"],
-            "raw_json" => record.to_json,
-          },
-          "hansard_records"
-        )
-      end
-
+      records.each { |record| save_record(record) }
       total_saved += records.size
       page += 1
+      if page > MAX_PAGES_PER_RUN
+        puts "hansard_records (#{label}): saved/updated #{total_saved} record(s) for " \
+          "#{date_from}..#{date_to} (hit the #{MAX_PAGES_PER_RUN}-page cap, not fully covered yet)"
+        return false
+      end
+
+      sleep DELAY_BETWEEN_REQUESTS
     end
 
-    puts "hansard_records: saved/updated #{total_saved} record(s) for #{date_from}..#{date_to}"
+    puts "hansard_records (#{label}): saved/updated #{total_saved} record(s) for #{date_from}..#{date_to}"
+    true
   end
 
-  def self.post_search(page:)
+  def self.save_record(record)
+    ScraperWiki.save_sqlite(
+      ["id"],
+      {
+        "id" => record["id"],
+        "documentType" => record["documentType"],
+        "documentSubtype" => record["documentSubtype"],
+        "sittingDate" => record["sittingDate"],
+        "parentId" => record["parentId"],
+        "raw_json" => record.to_json,
+      },
+      "hansard_records"
+    )
+  end
+
+  def self.post_search(date_from:, date_to:, page:)
     uri = URI(URL)
     request = Net::HTTP::Post.new(uri, "Content-Type" => "application/json", "User-Agent" => USER_AGENT)
     request.body = JSON.generate(dateFrom: date_from, dateTo: date_to, page: page, pageSize: PAGE_SIZE)
@@ -115,11 +163,18 @@ module SittingCalendar
     line&.split(":", 2)&.last&.strip
   end
 
+  # Past sitting dates don't change, so there's no need to re-fetch two decades of them every
+  # routine run - just enough of a look-back to catch anything recently added/amended. Set
+  # SITTING_CALENDAR_DATE_FROM to widen this for a one-off historical backfill.
+  def self.date_from
+    ENV["SITTING_CALENDAR_DATE_FROM"] || (Date.today - 90).iso8601
+  end
+
   def self.fetch_ics
     uri = URI(URL)
     uri.query = URI.encode_www_form(
       "c.hb" => "true",
-      "criteria.DateFrom" => "2003-01-01",
+      "criteria.DateFrom" => date_from,
       "criteria.DateTo" => (Date.today + 2 * 365).iso8601
     )
 
@@ -131,30 +186,7 @@ module SittingCalendar
   end
 end
 
-# TEMPORARY: fetches a trivial, non-Hansard URL so we can smoke-test morph.io's own build/run
-# pipeline on heroku-24 in isolation, without Hansard's own quirks (Radware, pagination, etc.)
-# in the way. Swap SmokeTest.run back for HansardSearch.run/SittingCalendar.run below once
-# we've confirmed this scraper runs cleanly on morph.io.
-module SmokeTest
-  URL = "https://example.com"
-
-  def self.run
-    uri = URI(URL)
-    request = Net::HTTP::Get.new(uri, "User-Agent" => USER_AGENT)
-    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
-    raise "GET #{URL} failed: #{response.code} #{response.message}" unless response.is_a?(Net::HTTPSuccess)
-
-    ScraperWiki.save_sqlite(
-      ["id"],
-      { "id" => 1, "fetched_at" => Time.now.utc.iso8601, "body_length" => response.body.length },
-      "smoke_test"
-    )
-    puts "smoke_test: fetched #{URL} OK (#{response.body.length} bytes)"
-  end
-end
-
 if __FILE__ == $PROGRAM_NAME
-  SmokeTest.run
-  # HansardSearch.run
-  # SittingCalendar.run
+  HansardSearch.run
+  # SittingCalendar.run - deferred for now, not needed yet
 end
