@@ -131,7 +131,30 @@ module SittingCalendar
   end
 end
 
+# TEMPORARY: fetches a trivial, non-Hansard URL so we can smoke-test morph.io's own build/run
+# pipeline on heroku-24 in isolation, without Hansard's own quirks (Radware, pagination, etc.)
+# in the way. Swap SmokeTest.run back for HansardSearch.run/SittingCalendar.run below once
+# we've confirmed this scraper runs cleanly on morph.io.
+module SmokeTest
+  URL = "https://example.com"
+
+  def self.run
+    uri = URI(URL)
+    request = Net::HTTP::Get.new(uri, "User-Agent" => USER_AGENT)
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
+    raise "GET #{URL} failed: #{response.code} #{response.message}" unless response.is_a?(Net::HTTPSuccess)
+
+    ScraperWiki.save_sqlite(
+      ["id"],
+      { "id" => 1, "fetched_at" => Time.now.utc.iso8601, "body_length" => response.body.length },
+      "smoke_test"
+    )
+    puts "smoke_test: fetched #{URL} OK (#{response.body.length} bytes)"
+  end
+end
+
 if __FILE__ == $PROGRAM_NAME
-  HansardSearch.run
-  SittingCalendar.run
+  SmokeTest.run
+  # HansardSearch.run
+  # SittingCalendar.run
 end

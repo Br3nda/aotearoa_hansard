@@ -84,6 +84,15 @@ with this working fix rather than the earlier "dead end" framing, which turned o
 pessimistic (it correctly ruled out the *naive* fix, but missed that the `buildpack.toml`
 override sidesteps the S3 gap entirely).
 
+**Does this force other scrapers onto a different Ruby version?** No - checked this explicitly,
+not just assumed it. Tested the stock, *unpatched* `v362` setup against a scraper with an old,
+Bundler-1.x-compatible lockfile (one that would never hit the bug this fixes) pinning a different
+Ruby version (`3.3.9`) - it already fails the exact same way (`Using Ruby version: ruby-3.2.2` /
+`Your Ruby version is 3.2.2, but your Gemfile specified 3.3.9`), with zero changes from us.
+`heroku-18` already only supports one Ruby version platform-wide, and it's already `3.2.2` in
+production today. This fix pins to that same version - it doesn't change which one is enforced,
+only fixes the separate lockfile-reading bug. Opened as `openaustralia/buildstep#10`.
+
 ## Next steps, in order
 
 1. ~~Confirm the buildpack install path~~ - done.
