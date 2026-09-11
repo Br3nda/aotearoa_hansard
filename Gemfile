@@ -8,8 +8,6 @@ source "https://rubygems.org"
 
 ruby "3.2.2"
 
-gem "mechanize", "~> 2.14.0"
-gem "nokogiri", "~> 1.17.2"
 gem "scraperwiki", git: "https://github.com/openaustralia/scraperwiki-ruby.git", branch: "morph_defaults"
 gem "sqlite3", "~> 2.2.0"
 
