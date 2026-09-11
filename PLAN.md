@@ -38,61 +38,61 @@ Confirmed:
   triggers for lockfiles written by modern Bundler, and doesn't touch the mechanism that reads a
   scraper's own declared Ruby version at all.
 
-## The fix attempt that didn't pan out
+## The fix - confirmed working, tested end-to-end
 
-Tried patching `openaustralia/buildstep`'s `Dockerfile.heroku-18` with a second
-`herokuish buildpack install` call (same mechanism already used to add the Perl buildpack),
-overriding the built-in Ruby buildpack at its confirmed real path,
-`/tmp/buildpacks/01_buildpack-ruby` (verified live via `docker run --rm
-gliderlabs/herokuish:v0.5.36-18 find / -maxdepth 4 -iname "*buildpack*" -type d` - matches our
-original crash stack trace exactly).
+Patched `openaustralia/buildstep`'s `Dockerfile.heroku-18` with a second `herokuish buildpack
+install` call (same mechanism already used to add the Perl buildpack), overriding the built-in
+Ruby buildpack at its confirmed real path, `/tmp/buildpacks/01_buildpack-ruby` (verified live via
+`docker run --rm gliderlabs/herokuish:v0.5.36-18 find / -maxdepth 4 -iname "*buildpack*" -type d`
+- matches our original crash stack trace exactly).
 
-Built and tested this locally against our real scraper before proposing it anywhere. Result:
-**dead end**, for a reason deeper than expected.
+First attempt (pin to a commit with the lockfile fix, nothing else) turned out to be a dead end,
+but a narrower one than it first looked:
 
-- Pinning to `heroku-buildpack-ruby`'s latest `main` (`14ba6e8b`) fixes the lockfile error, but
-  that same commit now hard-rejects the `heroku-18` stack outright ("the 'heroku-18' stack is no
-  longer supported") - Heroku dropped it upstream.
-- Pinning to an older commit from before that rejection was added (`9a1729e9`, "Stop bundling
-  bootstrap Ruby", 2024-07-09) gets past the lockfile error too, but now fails trying to
-  *download* a bootstrap Ruby from Heroku's own S3 bucket
-  (`heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/heroku-18/ruby-3.1.6.tgz`) - **403
-  Forbidden**, confirmed not a network issue on our end (plain `curl` to google.com from the same
-  container returns 200 fine).
-- Checked the actual commit history of `lib/language_pack/helpers/bundler_wrapper.rb`: the
-  commit that set the modern Bundler bootstrap default (`a88fe815`, "Default bundler to 2.5.23",
-  **2026-02-02**) landed over a year *after* the switch to S3-downloaded bootstrap Ruby
-  (`9a1729e9`, **2024-07-09**). Every commit with the fix already depends on the S3 download.
-  There is no commit in this repo's history that has both "modern Bundler" and "no S3
-  dependency" - they're structurally coupled.
+- Latest `main` (`14ba6e8b`) fixes the lockfile error, but hard-rejects `heroku-18` outright
+  ("the 'heroku-18' stack is no longer supported") - added in `173feef` ("Better errors on
+  bootstrap failure", 2025-08-06), confirmed via `git log -S` and reading the actual diff (lists
+  `heroku-18 | heroku-20` explicitly).
+- An older commit (`9a1729e9`, "Stop bundling bootstrap Ruby", 2024-07-09) gets past the lockfile
+  error, but fails downloading its *bootstrap* Ruby from Heroku's own S3 bucket - 403 Forbidden.
+  Traced the bootstrap version to `buildpack.toml`'s own `ruby_version` field (read by
+  `bin/support/download_ruby`, completely independent of anything in our scraper's own Gemfile).
+- Checked every "default" bootstrap version between the S3-download switch and the heroku-18
+  rejection (`3.1.6`, `3.3.7`, `3.3.8`, `3.3.9`, via direct `curl -I` against the S3 URLs) -
+  **all 403 for heroku-18**. Heroku's S3 bucket for that stack looks pruned down to whatever was
+  already cached before it went EOL, not the buildpack's own historical defaults.
+- Tested other versions directly: `ruby-3.2.2` - which happens to be exactly what our own
+  scraper's `Gemfile` already pins - **200 OK** on that same S3 path.
 
-**Conclusion: `heroku-18` is broken at the level of Heroku's own backing infrastructure, not
-just an out-of-date pin in `buildstep`.** They've cut off `heroku-18`-specific S3 assets,
-consistent with the stack being officially EOL. No Dockerfile patch on our side can route around
-that - there's nothing left to pin to that both works and stays on `heroku-18`.
+**The actual fix**: pin to `215828f` (`173feef`'s parent - the last commit before the heroku-18
+rejection landed), *and* patch `buildpack.toml` to force `ruby_version = "3.2.2"` instead of
+whatever that commit's own default happens to be:
 
-## What that means for the actual path forward
+```dockerfile
+RUN /bin/herokuish buildpack install https://github.com/heroku/heroku-buildpack-ruby.git 215828f6cab08236e1f90f6935b5982cc3be4643 01_buildpack-ruby && \
+    sed -i 's/ruby_version = ".*"/ruby_version = "3.2.2"/' /tmp/buildpacks/01_buildpack-ruby/buildpack.toml
+```
 
-This isn't "patch `heroku-18`" vs "do nothing" anymore - it's "`heroku-18` is a dead end, so
-`heroku-24` (the actually-current, actually-supported stack) is the only real path", which means
-someone needs to go back and actually diagnose *why* `heroku-24` broke everything when it was
-tried before (`openaustralia/morph#1456`/`#1440`, "nothing works on heroku-24") - that revert
-was for reasons unrelated to this Bundler issue, and hasn't been investigated by us at all yet.
+**Confirmed end-to-end** against the real `aotearoa_hansard` scraper (`docker run --rm -v
+.../aotearoa_hansard:/tmp/app <patched-image> /bin/herokuish buildpack build`): `Using Ruby
+version: ruby-3.2.2`, `Bundle complete! 3 Gemfile dependencies, 21 gems now installed.` No
+`LockfileError`, no download failure, no stack rejection. Already applied to the local
+`buildstep` clone.
 
-Worth filing the S3/heroku-18-EOL finding upstream regardless (in `heroku-buildpack-ruby` and/or
-`gliderlabs/herokuish`) as a courtesy - it's useful, precise information even if it doesn't
-unblock us directly.
+Filed as `openaustralia/morph#1530` (buildstep itself has issues disabled) - update that issue
+with this working fix rather than the earlier "dead end" framing, which turned out to be too
+pessimistic (it correctly ruled out the *naive* fix, but missed that the `buildpack.toml`
+override sidesteps the S3 gap entirely).
 
 ## Next steps, in order
 
 1. ~~Confirm the buildpack install path~~ - done.
-2. ~~Try patching `buildstep`'s `heroku-18` image~~ - done, dead end (see above). Don't propose
-   this Dockerfile change for real - it doesn't work.
-3. **Diagnose why `heroku-24` failed** in `openaustralia/morph#1440`/`#1456` - read what actually
-   broke, check if it's since been fixed independently, or root-cause it the same way we did
-   here. This is now the actual blocking work.
-4. Once something builds successfully: re-run `aotearoa_hansard` via `morph-cli`, confirm
-   `hansard_records`/`sitting_calendar_events` actually populate in `data.sqlite`.
+2. ~~Find a working buildpack pin~~ - done, see above. Confirmed working locally.
+3. Get this actually merged/deployed in `openaustralia/buildstep` (real PR, or however OAF wants
+   to land it - the change is one `RUN` line, already drafted and tested locally).
+4. Re-run `aotearoa_hansard` via `morph-cli` **against morph.io itself** once the patched image is
+   live there (not just the local Docker test), confirm `hansard_records`/`sitting_calendar_events`
+   actually populate in `data.sqlite`.
 5. Get `aotearoa_hansard` (and `aotearoa_hansard_transcripts`) marked private (internal OAF ask,
    not a cold request - see README).
 6. Confirm morph.io's scheduling behaviour (how often it re-runs a connected scraper) is sane
@@ -100,11 +100,12 @@ unblock us directly.
 7. **Not yet tested at all**: pulling this scraper's output back out via morph.io's own
    SQL-query API from the hotair Rails app - the other half of the design. Nothing built for
    this yet.
-8. Once the build pipeline actually works, start `aotearoa_hansard_transcripts`: reproduce the
+8. Once the build pipeline is confirmed live, start `aotearoa_hansard_transcripts`: reproduce the
    Capybara/Selenium question (`openaustralia/morph#1337`) against a plain page first, isolated
-   from Radware. Also worth checking whether whatever Chrome version `heroku-24` ships (136 as of
-   last check, vs `heroku-18`'s 103) is new enough to get past Radware's bot-check on the real
-   transcript pages, independent of the Selenium question.
+   from Radware - same "test the narrow thing before building on it" approach that worked here.
+   Also worth checking (same method: direct `curl -I` against the S3 bucket) whether
+   `heroku-18`'s pinned chromedriver/Chrome (103, June 2022) has the same kind of asset gap, and
+   whether `3.2.2`-style version pinning is needed there too.
 
 ## Parked, not blocking
 
