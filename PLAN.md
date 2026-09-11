@@ -38,46 +38,73 @@ Confirmed:
   triggers for lockfiles written by modern Bundler, and doesn't touch the mechanism that reads a
   scraper's own declared Ruby version at all.
 
-## The fix
+## The fix attempt that didn't pan out
 
-Two independent, non-competing options:
+Tried patching `openaustralia/buildstep`'s `Dockerfile.heroku-18` with a second
+`herokuish buildpack install` call (same mechanism already used to add the Perl buildpack),
+overriding the built-in Ruby buildpack at its confirmed real path,
+`/tmp/buildpacks/01_buildpack-ruby` (verified live via `docker run --rm
+gliderlabs/herokuish:v0.5.36-18 find / -maxdepth 4 -iname "*buildpack*" -type d` - matches our
+original crash stack trace exactly).
 
-1. **Patch `openaustralia/buildstep`'s `Dockerfile.heroku-18` directly** - add a second
-   `herokuish buildpack install` call (same mechanism already used to add the Perl buildpack)
-   pointing at a current `heroku-buildpack-ruby` ref, named to land at the same path as the
-   built-in one so it overrides rather than duplicates. Fully within OAF's control, doesn't wait
-   on anyone else.
-   - **Confirmed live** (`docker run --rm gliderlabs/herokuish:v0.5.36-18 find / -maxdepth 4
-     -iname "*buildpack*" -type d`): the built-in Ruby buildpack lives at
-     `/tmp/buildpacks/01_buildpack-ruby` - matches the path in our original crash stack trace
-     exactly. So the override call is:
-     ```dockerfile
-     RUN /bin/herokuish buildpack install https://github.com/heroku/heroku-buildpack-ruby.git <ref> 01_buildpack-ruby
-     ```
-     `<ref>` = a current `heroku-buildpack-ruby` tag/commit (need to pick one - HEAD of `main`,
-     or their latest tagged release, whichever OAF would rather pin to for stability).
-2. **File the pin bump upstream in `gliderlabs/herokuish` itself** - benefits everyone using
-   herokuish, not just us, and the project looks responsive enough that this is worth doing as a
-   courtesy alongside (1), not instead of it.
+Built and tested this locally against our real scraper before proposing it anywhere. Result:
+**dead end**, for a reason deeper than expected.
+
+- Pinning to `heroku-buildpack-ruby`'s latest `main` (`14ba6e8b`) fixes the lockfile error, but
+  that same commit now hard-rejects the `heroku-18` stack outright ("the 'heroku-18' stack is no
+  longer supported") - Heroku dropped it upstream.
+- Pinning to an older commit from before that rejection was added (`9a1729e9`, "Stop bundling
+  bootstrap Ruby", 2024-07-09) gets past the lockfile error too, but now fails trying to
+  *download* a bootstrap Ruby from Heroku's own S3 bucket
+  (`heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/heroku-18/ruby-3.1.6.tgz`) - **403
+  Forbidden**, confirmed not a network issue on our end (plain `curl` to google.com from the same
+  container returns 200 fine).
+- Checked the actual commit history of `lib/language_pack/helpers/bundler_wrapper.rb`: the
+  commit that set the modern Bundler bootstrap default (`a88fe815`, "Default bundler to 2.5.23",
+  **2026-02-02**) landed over a year *after* the switch to S3-downloaded bootstrap Ruby
+  (`9a1729e9`, **2024-07-09**). Every commit with the fix already depends on the S3 download.
+  There is no commit in this repo's history that has both "modern Bundler" and "no S3
+  dependency" - they're structurally coupled.
+
+**Conclusion: `heroku-18` is broken at the level of Heroku's own backing infrastructure, not
+just an out-of-date pin in `buildstep`.** They've cut off `heroku-18`-specific S3 assets,
+consistent with the stack being officially EOL. No Dockerfile patch on our side can route around
+that - there's nothing left to pin to that both works and stays on `heroku-18`.
+
+## What that means for the actual path forward
+
+This isn't "patch `heroku-18`" vs "do nothing" anymore - it's "`heroku-18` is a dead end, so
+`heroku-24` (the actually-current, actually-supported stack) is the only real path", which means
+someone needs to go back and actually diagnose *why* `heroku-24` broke everything when it was
+tried before (`openaustralia/morph#1456`/`#1440`, "nothing works on heroku-24") - that revert
+was for reasons unrelated to this Bundler issue, and hasn't been investigated by us at all yet.
+
+Worth filing the S3/heroku-18-EOL finding upstream regardless (in `heroku-buildpack-ruby` and/or
+`gliderlabs/herokuish`) as a courtesy - it's useful, precise information even if it doesn't
+unblock us directly.
 
 ## Next steps, in order
 
-1. ~~Confirm the buildpack install path~~ - done, see above.
-2. Patch and rebuild `buildstep`'s `heroku-18` image with the ruby buildpack override.
-3. Re-run `aotearoa_hansard` via `morph-cli` against the patched image, confirm
-   `hansard_records`/`sitting_calendar_events` actually populate in `data.sqlite` this time.
-4. Get `aotearoa_hansard` (and `aotearoa_hansard_transcripts`) marked private (internal OAF ask,
+1. ~~Confirm the buildpack install path~~ - done.
+2. ~~Try patching `buildstep`'s `heroku-18` image~~ - done, dead end (see above). Don't propose
+   this Dockerfile change for real - it doesn't work.
+3. **Diagnose why `heroku-24` failed** in `openaustralia/morph#1440`/`#1456` - read what actually
+   broke, check if it's since been fixed independently, or root-cause it the same way we did
+   here. This is now the actual blocking work.
+4. Once something builds successfully: re-run `aotearoa_hansard` via `morph-cli`, confirm
+   `hansard_records`/`sitting_calendar_events` actually populate in `data.sqlite`.
+5. Get `aotearoa_hansard` (and `aotearoa_hansard_transcripts`) marked private (internal OAF ask,
    not a cold request - see README).
-5. Confirm morph.io's scheduling behaviour (how often it re-runs a connected scraper) is sane
+6. Confirm morph.io's scheduling behaviour (how often it re-runs a connected scraper) is sane
    for our rolling 14-day window.
-6. **Not yet tested at all**: pulling this scraper's output back out via morph.io's own
+7. **Not yet tested at all**: pulling this scraper's output back out via morph.io's own
    SQL-query API from the hotair Rails app - the other half of the design. Nothing built for
    this yet.
-7. Once (1)-(3) prove the build pipeline actually works, start `aotearoa_hansard_transcripts`:
-   reproduce the Capybara/Selenium question (`openaustralia/morph#1337`) against a plain page
-   first, isolated from Radware - see that repo once it exists. Also worth checking whether
-   `heroku-18`'s pinned Chrome (103, June 2022) is even new enough to get past Radware's
-   bot-check on the real transcript pages, independent of the Selenium question.
+8. Once the build pipeline actually works, start `aotearoa_hansard_transcripts`: reproduce the
+   Capybara/Selenium question (`openaustralia/morph#1337`) against a plain page first, isolated
+   from Radware. Also worth checking whether whatever Chrome version `heroku-24` ships (136 as of
+   last check, vs `heroku-18`'s 103) is new enough to get past Radware's bot-check on the real
+   transcript pages, independent of the Selenium question.
 
 ## Parked, not blocking
 
