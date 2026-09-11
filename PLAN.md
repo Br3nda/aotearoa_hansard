@@ -47,18 +47,22 @@ Two independent, non-competing options:
    pointing at a current `heroku-buildpack-ruby` ref, named to land at the same path as the
    built-in one so it overrides rather than duplicates. Fully within OAF's control, doesn't wait
    on anyone else.
-   - **Not yet verified**: the exact install path the built-in Ruby buildpack occupies inside a
-     running `gliderlabs/herokuish:v0.5.36-18` container. Inferred as `buildpack-ruby` from the
-     source tree's naming, not confirmed live - check with
-     `docker run --rm gliderlabs/herokuish:v0.5.36-18 ls /buildpacks` before writing the real
-     Dockerfile change.
+   - **Confirmed live** (`docker run --rm gliderlabs/herokuish:v0.5.36-18 find / -maxdepth 4
+     -iname "*buildpack*" -type d`): the built-in Ruby buildpack lives at
+     `/tmp/buildpacks/01_buildpack-ruby` - matches the path in our original crash stack trace
+     exactly. So the override call is:
+     ```dockerfile
+     RUN /bin/herokuish buildpack install https://github.com/heroku/heroku-buildpack-ruby.git <ref> 01_buildpack-ruby
+     ```
+     `<ref>` = a current `heroku-buildpack-ruby` tag/commit (need to pick one - HEAD of `main`,
+     or their latest tagged release, whichever OAF would rather pin to for stability).
 2. **File the pin bump upstream in `gliderlabs/herokuish` itself** - benefits everyone using
    herokuish, not just us, and the project looks responsive enough that this is worth doing as a
    courtesy alongside (1), not instead of it.
 
 ## Next steps, in order
 
-1. Confirm the buildpack install path (the `docker run ... ls /buildpacks` check above).
+1. ~~Confirm the buildpack install path~~ - done, see above.
 2. Patch and rebuild `buildstep`'s `heroku-18` image with the ruby buildpack override.
 3. Re-run `aotearoa_hansard` via `morph-cli` against the patched image, confirm
    `hansard_records`/`sitting_calendar_events` actually populate in `data.sqlite` this time.
